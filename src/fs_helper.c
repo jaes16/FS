@@ -25,34 +25,6 @@
 
 
 
-/*
-#define DRIVE_SIZE 10485760 // 10 mbytes
-#define BLOCK_SIZE 4096 // 4 kbytes
-#define SEGMENT_SIZE 131072 // 128 kbytes
-#define DATA_SIZE 10223616 // DRIVE_SIZE - (2*SEGMENT_SIZE)
-#define INODE_SIZE 100
-#define ITABLE_ENTRY_SIZE 104 // INODE_SIZE + int
-#define ITABLE_MAX_SIZE 259584 // ITABLE_ENTRY_SIZE * MAX_INODES
-#define DT_ENTRY_SIZE 36 // 36 bytes
-#define DIR_TABLE_SIZE 113 // BLOCK_SIZE/sizeof(dir_table)
-
-#define MAX_BLOCKS 2496 // DATA_SIZE/BLOCK_SIZE
-#define MAX_DATA_BLOCKS 2418 // MAX_SEGMENTS * DATA_BLOCKS_IN_SEGMENT
-#define DATA_BLOCKS_IN_SEGMENT 31 // SEGMENT_SIZE/BLOCK_SIZE -1
-#define MAX_SEGMENTS 78 // DATA_SIZE/SEGMENT_SIZE
-#define MAX_INODES 2496 // = MAX_BLOCKS (sort of overshooting)
-#define MAX_ITABLE_BLOCKS 64 // ITABLE_MAX_SIZE/BLOCK_SIZE rounded up
-#define ITABLE_ENT_IN_BLOCK 39 // BLOCK_SIZE/ITABLE_ENTRY_SIZE
-
-#define DATA_START 131072 // = SEGMENT_SIZE
-#define SECOND_CR 10354688 // DRIVE_SIZE - SEGMENT_SIZE
-
-#define MAX_PATH 4096 // 4 kbytes
-#define MAX_FILE_NAME 32
-*/
-
-
-
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 // CODE CODE CODE CODE CODE CODE CODE CODE CODE CODE CODE CODE CODE CODE CODE CODE CODE CODE CODE CODE CODE CODE CODE CODE CODE CODE CODE CODE CODE CODE CODE CODE /
@@ -76,7 +48,7 @@ void write_checkpoint()
   checkpoint check;
 
   // go through checkpoint region and find an empty spot to write this checkpoint to
-  for(int i = 0; i < DATA_BLOCKS_IN_SEGMENT; i++){
+  for(int i = 0; i < (DATA_BLOCKS_IN_SEGMENT-1); i++){
     memset(&check, 0, BLOCK_SIZE);
     pread(fd_drive, &check, BLOCK_SIZE, BLOCK_SIZE*(i+1));
     if(check.num_itable_blocks == 0){
@@ -105,26 +77,36 @@ void write_checkpoint()
 
 
 // returns -1 for enospc
-int write_seg_summary()
+int write_seg_summary(int seg)
 {
-  if(is_unflushed_memory(cp.segsum_loc) == 1){
-    memset(segment[((cp.segsum_loc%SEGMENT_SIZE)/BLOCK_SIZE)], 0, BLOCK_SIZE);
-    memcpy(segment[((cp.segsum_loc%SEGMENT_SIZE)/BLOCK_SIZE)], &ss, BLOCK_SIZE);
-    return 0;
+  if(is_unflushed_memory(cp.segsum_loc[seg]) == 1){
+    memset(segment[((cp.segsum_loc[seg]%SEGMENT_SIZE)/BLOCK_SIZE)], 0, BLOCK_SIZE);
+    memcpy(segment[((cp.segsum_loc[seg]%SEGMENT_SIZE)/BLOCK_SIZE)], &ss[seg], BLOCK_SIZE);
+    return cp.segsum_loc[seg];
   }
+
+  int previous_segment = (cp.segsum_loc[seg]/SEGMENT_SIZE)-1;
+  int previous_block = (cp.segsum_loc[seg]%SEGMENT_SIZE)/BLOCK_SIZE;
+
   // check if a block is available in segment
   for(int i = 0; i < DATA_BLOCKS_IN_SEGMENT; i++){
-    if(ss.liveness[which_seg][i] == 0){
-      ss.liveness[which_seg][i] = 1;
-      if(cp.segsum_loc !=  0) ss.liveness[(cp.segsum_loc/SEGMENT_SIZE)-1][(cp.segsum_loc%SEGMENT_SIZE)/BLOCK_SIZE] = 0; // might have to change this later (0 -> -1)
-      
+    if(ss[which_seg/SEG_SUM_IN_BLOCK].liveness[which_seg%SEG_SUM_IN_BLOCK][i] == 0){
+      // update segment summary
+      ss[which_seg/SEG_SUM_IN_BLOCK].liveness[which_seg%SEG_SUM_IN_BLOCK][i] = 1;
+      ss[previous_segment/SEG_SUM_IN_BLOCK].liveness[previous_segment%SEG_SUM_IN_BLOCK][previous_block] = 3; // there is always a previous copy
+      ss[which_seg/SEG_SUM_IN_BLOCK].inode_num[which_seg%SEG_SUM_IN_BLOCK][i] = -2;
+
+      // write out this segment summary
       seg_summary *block = (seg_summary *) malloc(BLOCK_SIZE);
       memset(block, 0, BLOCK_SIZE);
-      memcpy(block, &ss, BLOCK_SIZE);
+      memcpy(block, &ss[seg], BLOCK_SIZE);
       segment[i] = block;
 
-      cp.segsum_loc = (((which_seg + 1) * SEGMENT_SIZE) + (i * BLOCK_SIZE));
-      return 0;
+      // we'll defer writing out the segment summaries that contain which_seg and previous_seg for later
+
+      // update cp pointer
+      cp.segsum_loc[seg] = ((which_seg + 1) * SEGMENT_SIZE) + (i * BLOCK_SIZE);
+      return ((which_seg + 1) * SEGMENT_SIZE) + (i * BLOCK_SIZE);
     }
   }
 
@@ -132,16 +114,23 @@ int write_seg_summary()
   flush_segment();
   free_segment();
   if(get_segment() == -1) return -1;
-  ss.liveness[which_seg][0] = 1;
-  if(cp.segsum_loc != 0) ss.liveness[(cp.segsum_loc/SEGMENT_SIZE)-1][(cp.segsum_loc%SEGMENT_SIZE)/BLOCK_SIZE] = 0; // might have to change this later (0 -> -1)
 
+  // update segment summary
+  ss[which_seg/SEG_SUM_IN_BLOCK].liveness[which_seg%SEG_SUM_IN_BLOCK][0] = 1;
+  ss[previous_segment/SEG_SUM_IN_BLOCK].liveness[previous_segment%SEG_SUM_IN_BLOCK][previous_block] = 3; // there is always a previous copy
+  ss[which_seg/SEG_SUM_IN_BLOCK].inode_num[which_seg%SEG_SUM_IN_BLOCK][0] = -2;
+
+  // write out this segmnt summary
   seg_summary *block = (seg_summary *) malloc(BLOCK_SIZE);
   memset(block, 0, BLOCK_SIZE);
-  memcpy(block, &ss, BLOCK_SIZE);
+  memcpy(block, &ss[seg], BLOCK_SIZE);
   segment[0] = block;
 
-  cp.segsum_loc = ((which_seg + 1) * SEGMENT_SIZE);
-  return 0;
+  // again, we'll defer writing out the segment summaries that contain which_seg and previous_seg for later
+
+  // update cp pointer
+  cp.segsum_loc[seg] = (which_seg + 1) * SEGMENT_SIZE;
+  return (which_seg + 1) * SEGMENT_SIZE;
 }
 
 
@@ -152,9 +141,9 @@ void flush_segment()
 {
 
   for(int i = 0; i < DATA_BLOCKS_IN_SEGMENT; i++){
-    if(ss.liveness[which_seg][i] == 1){ // if live and unflushed
+    if(ss[which_seg/SEG_SUM_IN_BLOCK].liveness[which_seg%SEG_SUM_IN_BLOCK][i] == 1){ // if live and unflushed
       pwrite(fd_drive, segment[i], BLOCK_SIZE, ((which_seg+1) * SEGMENT_SIZE) + (i * BLOCK_SIZE));
-      ss.liveness[which_seg][i] = 2;
+      ss[which_seg/SEG_SUM_IN_BLOCK].liveness[which_seg%SEG_SUM_IN_BLOCK][i] = 2;
     }
   }
 
@@ -197,7 +186,7 @@ int is_unflushed_memory(int address)
 {
   // see if this address is within the segment, and whether the particular block hasn't been written out to drive
   if((address >= ((which_seg+1)*SEGMENT_SIZE)) && (address < ((which_seg+2)*SEGMENT_SIZE))) {
-    if(ss.liveness[which_seg][(address%SEGMENT_SIZE)/BLOCK_SIZE] == 1) {
+    if(ss[which_seg/SEG_SUM_IN_BLOCK].liveness[which_seg%SEG_SUM_IN_BLOCK][(address%SEGMENT_SIZE)/BLOCK_SIZE] == 1) {
       return 1;
     }
     return 0;
@@ -211,7 +200,7 @@ int is_unflushed_memory(int address)
 
 // receives a malloced pointer to a block size load of data,
 // return -1 if unable to allocate more space, otherwise returns the absolute address of the where the block was added
-int add_to_segment(void *block, int address)
+int add_to_segment(void *block, int address, int inode_num)
 {
   if((address != 0) && (is_unflushed_memory(address) == 1)){
     memset(segment[((address%SEGMENT_SIZE)/BLOCK_SIZE)], 0, BLOCK_SIZE);
@@ -219,13 +208,27 @@ int add_to_segment(void *block, int address)
     free(block);
     return address;
   }
+
+  int previous_segment = (address/SEGMENT_SIZE)-1;
+  int previous_block = (address%SEGMENT_SIZE)/BLOCK_SIZE;
+
   // check if a block is available in segment
   for(int i = 0; i < DATA_BLOCKS_IN_SEGMENT; i++){
-    if(ss.liveness[which_seg][i] == 0){
+    if(ss[(which_seg/SEG_SUM_IN_BLOCK)].liveness[which_seg%SEG_SUM_IN_BLOCK][i] == 0){
+
+      // add to segment
       segment[i] = block;
-      ss.liveness[which_seg][i] = 1;
-      if(address !=  0) ss.liveness[(address/SEGMENT_SIZE)-1][(address%SEGMENT_SIZE)/BLOCK_SIZE] = 0; // might have to change this later (0 -> -1)
-      write_seg_summary();
+
+      // update segsum to denote this new block as taken and the block it was in (if address != 0) as unused now
+      ss[which_seg/SEG_SUM_IN_BLOCK].liveness[which_seg%SEG_SUM_IN_BLOCK][i] = 1;
+      if(address !=  0) ss[previous_segment/SEG_SUM_IN_BLOCK].liveness[previous_segment%SEG_SUM_IN_BLOCK][previous_block] = 3; // might have to change this later (0 -> -1)
+      ss[which_seg/SEG_SUM_IN_BLOCK].inode_num[which_seg%SEG_SUM_IN_BLOCK][i] = inode_num;
+
+      // update segsum in memory
+      write_seg_summary(which_seg/SEG_SUM_IN_BLOCK);
+      write_seg_summary(previous_segment/SEG_SUM_IN_BLOCK);
+
+      // return the new address of the block
       return(((which_seg + 1) * SEGMENT_SIZE) + (i * BLOCK_SIZE));
     }
   }
@@ -235,11 +238,19 @@ int add_to_segment(void *block, int address)
   free_segment();
   if(get_segment() == -1) return -1;
 
-  ss.liveness[which_seg][0] = 1;
+  // add to segment
   segment[0] = block;
 
-  if(address != 0) ss.liveness[(address/SEGMENT_SIZE)-1][(address%SEGMENT_SIZE)/BLOCK_SIZE] = 0; // might have to change this later (0 -> -1)
-  write_seg_summary();
+  // update segsum to denote this new block as taken and the block it was in (if address != 0) as unused now
+  ss[which_seg/SEG_SUM_IN_BLOCK].liveness[which_seg%SEG_SUM_IN_BLOCK][0] = 1;
+  if(address != 0) ss[previous_segment/SEG_SUM_IN_BLOCK].liveness[previous_segment%SEG_SUM_IN_BLOCK][previous_block] = 3; // might have to change this later (0 -> -1)
+  ss[which_seg/SEG_SUM_IN_BLOCK].inode_num[which_seg%SEG_SUM_IN_BLOCK][0] = inode_num;
+
+  // update segsum in memory
+  write_seg_summary(which_seg/SEG_SUM_IN_BLOCK);
+  write_seg_summary(previous_segment/SEG_SUM_IN_BLOCK);
+
+  // return the new address of the block
   return((which_seg + 1) * SEGMENT_SIZE);
 }
 
@@ -268,14 +279,20 @@ void create_init_drive()
   inode rootnode;
 
   // prepare first segment with segment summary, rootdir, itable
-  memset(&ss, 0, BLOCK_SIZE);
+  memset(&ss, 0, BLOCK_SIZE*SEG_SUM_BLOCKS);
   memset(&rootnode, 0, INODE_SIZE);
   memset(d_table, 0, sizeof(d_table));
 
-  seg_summary *block = malloc(BLOCK_SIZE);
-  ss.liveness[0][0] = 1;
-  memcpy(block, &ss, BLOCK_SIZE);
-  segment[0] = block;
+  seg_summary *block1 = malloc(BLOCK_SIZE);
+  seg_summary *block2 = malloc(BLOCK_SIZE);
+  ss[0].liveness[0][0] = 1;
+  ss[0].liveness[0][1] = 1;
+  memcpy(block1, &ss[0], BLOCK_SIZE);
+  memset(block2, 0, BLOCK_SIZE);
+  segment[0] = block1;
+  segment[1] = block2;
+  cp.segsum_loc[0] = SEGMENT_SIZE;
+  cp.segsum_loc[1] = SEGMENT_SIZE+BLOCK_SIZE;
 
   // rootdir data preparation. set up . and .. in root
   d_table[0].inode_num = 1; // using first inode number, 1
@@ -284,25 +301,35 @@ void create_init_drive()
   d_table[1].file_name[0] = '.';
   d_table[1].file_name[1] = '.';
 
+  // make sure its in memory
+  dir_table *block3 = (dir_table *) malloc(BLOCK_SIZE);
+  memset(block3, 0, sizeof(dir_table) * (DIR_TABLE_SIZE+1));
+  memcpy(block3, d_table, BLOCK_SIZE);
+  rootnode.blocks[0] = add_to_segment(block3, 0, 1);
+
   // prepare for inode in inode table
   rootnode.mode = S_IFDIR | S_IRWXU | S_IRWXG | S_IRWXO;
   rootnode.uid = 0;
   rootnode.size = sizeof(dir_table) * 2;
-  time_t t = time(NULL);
-  struct tm tm = *localtime(&t);
-  rootnode.time = tm.tm_sec;
-  rootnode.ctime = tm.tm_sec;
-  rootnode.mtime = tm.tm_sec;
+  rootnode.time = time(NULL);
+  rootnode.ctime = time(NULL);
+  rootnode.mtime = time(NULL);
   rootnode.dtime = 0;
   rootnode.links_count = 1;
   rootnode.block_count = 1;
-  rootnode.blocks[0] = SEGMENT_SIZE+BLOCK_SIZE;
 
   // initialize inode table and place the first inode
   itable = (i_table *) malloc(BLOCK_SIZE);
   memset(itable, 0, BLOCK_SIZE);
   itable[0].num_to_inodes[0].inode_num = 1;
   memcpy(&itable[0].num_to_inodes[0].inode, &rootnode, INODE_SIZE);
+
+  // write out itable
+  i_table *block4 = (i_table *) malloc(BLOCK_SIZE);
+  memset(block4, 0, BLOCK_SIZE);
+  memcpy(block4, itable, BLOCK_SIZE);
+  cp.pointers[0] = add_to_segment(block4, 0, -1);
+
 
   // prepare superblock
   sb.checkpoint_location = BLOCK_SIZE;
@@ -316,9 +343,8 @@ void create_init_drive()
   cp.num_inodes = 1;
   cp.inode_numbers[0] = 32;
   cp.inode_numbers[1] = 1;
-  cp.pointers[0] = SEGMENT_SIZE+(BLOCK_SIZE*2); // the first segment is for cr, then one block for segsum, one for rootdir data
   cp.segments_usage[0] = 1;
-  cp.segsum_loc = SEGMENT_SIZE;
+
 
   // finally write out in block sizes
   // write out sb and checkpoints, to both checkpoint regions
@@ -326,19 +352,6 @@ void create_init_drive()
   pwrite(fd_drive, &sb, BLOCK_SIZE, SECOND_CR);
   pwrite(fd_drive, &cp, BLOCK_SIZE, BLOCK_SIZE);
   pwrite(fd_drive, &cp, BLOCK_SIZE, SECOND_CR + BLOCK_SIZE);
-  // write out rootdir and itable
-
-  // make sure its in memory
-  dir_table *block1 = (dir_table *) malloc(BLOCK_SIZE);
-  memset(block1, 0, sizeof(dir_table) * (DIR_TABLE_SIZE+1));
-  memcpy(block1, d_table, BLOCK_SIZE);
-  add_to_segment(block1,0);
-
-  i_table *block2 = (i_table *) malloc(BLOCK_SIZE);
-  memset(block2, 0, BLOCK_SIZE);
-  memcpy(block2, itable, BLOCK_SIZE);
-  add_to_segment(block2,0);
-
 }
 
 
@@ -364,7 +377,7 @@ int find_inode(int inode_num, inode *id)
 
 /*
   changes the inode specified by inode_num.
-  if update is 0, then we are adding a new inode to the table; if update is 1, then we are chaning an inode, if update -1, then we are removing the inode
+  if update is 0, then we are adding a new inode to the table; if update is 1, then we are changing an inode, if update -1, then we are removing the inode
   returns -1 for ENOSPC, 0 for success
 */
 int change_inode(int inode_num, inode *id, int update)
@@ -381,7 +394,7 @@ int change_inode(int inode_num, inode *id, int update)
           i_table *block = (i_table *) malloc(BLOCK_SIZE);
           memcpy(block, &itable[i], BLOCK_SIZE);
           // make appropriate changes to checkpoint
-          cp.pointers[i] = add_to_segment(block, cp.pointers[i]);
+          cp.pointers[i] = add_to_segment(block, cp.pointers[i], -1);
           if(cp.pointers[i] == -1) return -1;
 
           return 0;
@@ -398,7 +411,7 @@ int change_inode(int inode_num, inode *id, int update)
           i_table *block = (i_table *) malloc(BLOCK_SIZE);
           memcpy(block, &itable[i], BLOCK_SIZE);
           // make appropriate changes to checkpoint
-          cp.pointers[i] = add_to_segment(block, cp.pointers[i]);
+          cp.pointers[i] = add_to_segment(block, cp.pointers[i], -1);
           if(cp.pointers[i] == -1) return -1;
 
           return 0;
@@ -414,7 +427,7 @@ int change_inode(int inode_num, inode *id, int update)
           i_table *block = (i_table *) malloc(BLOCK_SIZE);
           memcpy(block, &itable[i], BLOCK_SIZE);
           // make appropriate changes to checkpoint
-          cp.pointers[i] = add_to_segment(block, cp.pointers[i]);
+          cp.pointers[i] = add_to_segment(block, cp.pointers[i], -1);
           if(cp.pointers[i] == -1) return -1;
 
           return 0;
@@ -441,7 +454,7 @@ int change_inode(int inode_num, inode *id, int update)
   i_table *newblock = (i_table *) malloc(BLOCK_SIZE);
   memcpy(newblock, &itable[cp.num_itable_blocks], BLOCK_SIZE);
   cp.num_itable_blocks++;
-  cp.pointers[cp.num_itable_blocks-1] = add_to_segment(newblock, cp.pointers[cp.num_itable_blocks-1]);
+  cp.pointers[cp.num_itable_blocks-1] = add_to_segment(newblock, cp.pointers[cp.num_itable_blocks-1], -1);
   if(cp.pointers[cp.num_itable_blocks-1] == -1) return -ENOSPC;
   return 0;
 }
@@ -501,7 +514,7 @@ int add_dir_entry(char *file_name, int inode_num, int parent_inode_num, inode *p
         // make sure the changes in the table are gonna be made in drive
         dir_table *block = (dir_table *) malloc(BLOCK_SIZE);
         memcpy(block, &dtable, BLOCK_SIZE);
-        parent_id->blocks[i] = add_to_segment(block, parent_id->blocks[i]);
+        parent_id->blocks[i] = add_to_segment(block, parent_id->blocks[i], parent_inode_num);
         if(parent_id->blocks[i] == -1) return -1;
 
 
@@ -521,7 +534,7 @@ int add_dir_entry(char *file_name, int inode_num, int parent_inode_num, inode *p
   // write out
   dir_table *block = (dir_table *) malloc(BLOCK_SIZE);
   memcpy(block, &dtable, BLOCK_SIZE);
-  parent_id->blocks[parent_id->block_count] = add_to_segment(block, parent_id->blocks[parent_id->block_count]);
+  parent_id->blocks[parent_id->block_count] = add_to_segment(block, parent_id->blocks[parent_id->block_count], parent_inode_num);
   if(parent_id->blocks[parent_id->block_count] == -1) return -1;
   parent_id->block_count++;
   parent_id->size = parent_id->size + DT_ENTRY_SIZE;
@@ -556,7 +569,7 @@ int remove_dir_entry(int inode_num, int parent_inode_num, inode *parent_id)
         // make sure the changes in the table are gonna be made in drive
         dir_table *block = (dir_table *) malloc(BLOCK_SIZE);
         memcpy(block, &dtable, BLOCK_SIZE);
-        parent_id->blocks[i] = add_to_segment(block, parent_id->blocks[i]);
+        parent_id->blocks[i] = add_to_segment(block, parent_id->blocks[i], parent_inode_num);
         if(parent_id->blocks[i] == -1) return -1;
 
 
@@ -634,31 +647,130 @@ int get_inode(const char *path, inode *id)
 
 
 
-/*
 int garbage_collection()
 {
-  // to keep track of segment we are writing out
-  // go through
+  // block to fill
+
+  int p = 0;
+  int seg_num = 0;
   for(int i = 0; i < MAX_SEGMENTS; i++){
-    // check if valid segment
-    if((cp.segments_usage[i] != 0) && (i != which_seg)){
-
-      // read segment summary
-      memset(&ss, 0, BLOCK_SIZE);
-      pread(fd_drive, &ss, BLOCK_SIZE, (i+1) * SEGMENT_SIZE);
-
-      // go through all blocks
-      for(int j = 0; j < DATA_BLOCKS_IN_SEGMENT; j++){
-        if(ss.liveness[j] != 0){
-          // read block
-          memset(block,0,)
-          read_block()
-          // check if live block
-          if()
-        }
-      }
+    if((cp.segments_usage[i] == 0) && (i != which_seg)){
+      seg_num = i;
+      cp.segments_usage[i] = 2;
+      break;
     }
   }
 
+  char output[DATA_BLOCKS_IN_SEGMENT][BLOCK_SIZE];
+  char s[DATA_BLOCKS_IN_SEGMENT][BLOCK_SIZE];
+
+
+  // go through all segments
+  for(int i = 0; i < MAX_SEGMENTS; i++){
+    // check if valid segment, but hasn't been written out and isn't the block currently being written in memory
+    if((cp.segments_usage[i] == 1) && (i != which_seg)){
+
+      int i_2 = i/SEG_SUM_IN_BLOCK;
+      int i_3 = i%SEG_SUM_IN_BLOCK;
+
+      // go through all blocks
+      pread(fd_drive, s, SEGMENT_SIZE, (i+1) * SEGMENT_SIZE);
+      for(int j = 0; j < DATA_BLOCKS_IN_SEGMENT; j++){
+
+        // check if live block
+        if((ss[i_2].liveness[i_3][j] != 0) && (ss[i_2].liveness[i_3][j] != 3)){
+
+          // add block to segment to write out
+
+          // check if we can put more into this output segment
+          int whatthef = seg_num; // don't know why, but after this if statement, seg_num sets to zero and won't be set to anything else
+          if(p == DATA_BLOCKS_IN_SEGMENT) {// we've filled this output segment. Write it out
+
+            // write out
+            perase(1, whatthef);
+            seg_num = whatthef;
+            pwrite(fd_drive, output, SEGMENT_SIZE, SEGMENT_SIZE * (whatthef+1));
+
+            int seg_num = -1;
+            // go through and see if there is a segment we can get
+            for(int k = 0; k < MAX_SEGMENTS; k++){
+              if(cp.segments_usage[k] == 0){ // found an empty segment
+
+                seg_num = k;
+                cp.segments_usage[k] = 2;
+
+                // clean the output segment and start again
+                memset(output, 0, SEGMENT_SIZE);
+                p = 0;
+
+                break;
+              }
+            }
+
+            // check if we were able to write out the output segment
+            if(seg_num == -1) return -1; // weren't able to write out. return error
+          }
+
+          // either we did write output out or we had enough space in the first place
+          memcpy(output[p], s[j], BLOCK_SIZE);
+          ss[seg_num/SEG_SUM_IN_BLOCK].liveness[seg_num%SEG_SUM_IN_BLOCK][p] = 2;
+          ss[seg_num/SEG_SUM_IN_BLOCK].inode_num[seg_num%SEG_SUM_IN_BLOCK][p] = ss[i_2].inode_num[i_3][j];
+
+
+          // update segment summary and keep hold of all the inode numbers/segsum/itable and which block of those structs
+          if(ss[i_2].inode_num[i_3][j] == -1){ // this is a block for itable
+            for(int l = 0; l < MAX_ITABLE_BLOCKS; l++){
+              if((( (i + 1) * SEGMENT_SIZE) + (j * BLOCK_SIZE)) == cp.pointers[l]){
+                // change the address
+                cp.pointers[l] = ((seg_num+1) * SEGMENT_SIZE) + (p*BLOCK_SIZE);
+                break;
+              }
+            }
+          } else if(ss[i_2].inode_num[i_3][j] == -2){ // this is a block for segsum
+            for(int l = 0; l < SEG_SUM_BLOCKS; l++){
+              if((( (i + 1) * SEGMENT_SIZE) + (j * BLOCK_SIZE)) == cp.segsum_loc[l]){
+                // change the address
+                cp.segsum_loc[l] = ((seg_num+1) * SEGMENT_SIZE) + (p*BLOCK_SIZE);
+                break;
+              }
+            }
+          } else { // just a regular block for an inode
+            // find out which block of the inode this one is
+            //////////////////// WANT TO CHANGE THIS TO BE MORE EFFICIENT ////////////////////
+            inode id;
+            find_inode(ss[i_2].inode_num[i_3][j], &id);
+            for(int l = 0; l < id.block_count; l++){
+              if((( (i + 1) * SEGMENT_SIZE) + (j * BLOCK_SIZE)) == id.blocks[l]){
+                // change the address
+                id.blocks[l] = ((seg_num+1) * SEGMENT_SIZE) + (p*BLOCK_SIZE);
+                break;
+              }
+            }
+            change_inode(ss[i_2].inode_num[i_3][j], &id, 1);
+          }
+
+          p++;
+
+        }
+
+        // now this block is empty
+        ss[i_2].liveness[i_3][j] = 0;
+        ss[i_2].inode_num[i_3][j] = 0;
+
+      }
+
+      // finished writing out all valid blocks in the segment
+      perase(1,i);
+      cp.segments_usage[i] = 0;
+    }
+  }
+
+  // finished garbage collection
+  for(int i = 0; i < MAX_SEGMENTS; i++){ // update cp appropriately
+    if(cp.segments_usage[i] == 2) cp.segments_usage[i] = 1;
+  }
+
+  // just because we finished garbage collection doesn't mean we necessarily created anymore space. Might be that all blocks of all segments are live
+  return 0;
+
 }
-*/

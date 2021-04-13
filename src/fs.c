@@ -28,36 +28,6 @@
 
 
 
-
-/*
-#define DRIVE_SIZE 10485760 // 10 mbytes
-#define BLOCK_SIZE 4096 // 4 kbytes
-#define SEGMENT_SIZE 131072 // 128 kbytes
-#define DATA_SIZE 10223616 // DRIVE_SIZE - (2*SEGMENT_SIZE)
-#define INODE_SIZE 100
-#define ITABLE_ENTRY_SIZE 104 // INODE_SIZE + int
-#define ITABLE_MAX_SIZE 259584 // ITABLE_ENTRY_SIZE * MAX_INODES
-#define DT_ENTRY_SIZE 36 // 36 bytes
-#define DIR_TABLE_SIZE 113 // BLOCK_SIZE/sizeof(dir_table)
-
-#define MAX_BLOCKS 2496 // DATA_SIZE/BLOCK_SIZE
-#define MAX_DATA_BLOCKS 2418 // MAX_SEGMENTS * DATA_BLOCKS_IN_SEGMENT
-#define DATA_BLOCKS_IN_SEGMENT 31 // SEGMENT_SIZE/BLOCK_SIZE -1
-#define MAX_SEGMENTS 78 // DATA_SIZE/SEGMENT_SIZE
-#define MAX_INODES 2496 // = MAX_BLOCKS (sort of overshooting)
-#define MAX_ITABLE_BLOCKS 64 // ITABLE_MAX_SIZE/BLOCK_SIZE rounded up
-#define ITABLE_ENT_IN_BLOCK 39 // BLOCK_SIZE/ITABLE_ENTRY_SIZE
-
-#define DATA_START 131072 // = SEGMENT_SIZE
-#define SECOND_CR 10354688 // DRIVE_SIZE - SEGMENT_SIZE
-
-#define MAX_PATH 4096 // 4 kbytes
-#define MAX_FILE_NAME 32
-*/
-
-
-
-
 ////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 // GLOBAL VARIABLES ////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 ////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -65,7 +35,7 @@
 
 
 void *segment[DATA_BLOCKS_IN_SEGMENT]; // might not always be filled, depending on the size of the data the pointers point to
-seg_summary ss;
+seg_summary ss[SEG_SUM_BLOCKS];
 int which_seg;
 
 i_table *itable; // table of inodes. Can grow and shrink as needed, in sizes of blocks. Must malloc realloc and free
@@ -129,7 +99,14 @@ void* fs_init(struct fuse_conn_info *conn){
     }
 
     memset(&ss, 0, BLOCK_SIZE);
-    pread(fd_drive, &ss, BLOCK_SIZE, cp.segsum_loc);
+    for(i = 0; i < SEG_SUM_BLOCKS; i++){
+      pread(fd_drive, &ss[i], BLOCK_SIZE, cp.segsum_loc[i]);
+    }
+
+    for(i = 0; i < SEG_SUM_BLOCKS; i++){
+      int s = ((cp.segsum_loc[i]/SEGMENT_SIZE) - 1);
+      ss[s/SEG_SUM_IN_BLOCK].liveness[s%SEG_SUM_IN_BLOCK][(cp.segsum_loc[i]/4096)%DATA_BLOCKS_IN_SEGMENT] = 2;
+    }
 
     get_segment();
 
@@ -157,7 +134,9 @@ void* fs_init(struct fuse_conn_info *conn){
 void fs_destroy(void *privatedata)
 {
   flush_segment();
-  write_seg_summary();
+  for(int i = 0; i < SEG_SUM_BLOCKS; i++){
+    write_seg_summary(i);
+  }
   write_checkpoint();
   flush_segment();
   free_segment();
@@ -264,7 +243,7 @@ int fs_mkdir(const char* path, mode_t mode)
 {
   inode id;
   inode parent_id;
-  int inode_number = 0;
+  int inode_num = 0;
   int parent_inode_num;
 
   // check if file exists
@@ -298,7 +277,7 @@ int fs_mkdir(const char* path, mode_t mode)
   // see if there is a free inode number for this new directory
   for(int i = 0; i < MAX_INODES; i++){
     if(cp.inode_numbers[i] == 0){
-      inode_number = i;
+      inode_num = i;
       cp.inode_numbers[i] = 1;
       cp.num_inodes++;
       break;
@@ -308,11 +287,11 @@ int fs_mkdir(const char* path, mode_t mode)
   // see if we can write out a block for directory data
   dir_table *dir_data = (dir_table *) malloc(BLOCK_SIZE);
   memset(dir_data, 0, BLOCK_SIZE);
-  dir_data[0].inode_num = inode_number;
+  dir_data[0].inode_num = inode_num;
   strcpy(dir_data[0].file_name, ".");
   dir_data[1].inode_num = parent_inode_num;
   strcpy(dir_data[1].file_name, "..");
-  id.blocks[0] = add_to_segment(dir_data, 0);
+  id.blocks[0] = add_to_segment(dir_data, 0, inode_num);
   if(id.blocks[0] == -1) return -ENOSPC;
 
   // create inode
@@ -327,12 +306,12 @@ int fs_mkdir(const char* path, mode_t mode)
   id.block_count = 1;
 
   // add to parent directory data
-  call_rslt = add_dir_entry(file_name, inode_number, parent_inode_num, &parent_id);
+  call_rslt = add_dir_entry(file_name, inode_num, parent_inode_num, &parent_id);
   if(call_rslt == -1) return -ENOSPC;
   else if(call_rslt == -2) return -ENAMETOOLONG;
 
   // add inode and inode number pair to itable
-  if(change_inode(inode_number, &id, 0) == -1) return -ENOSPC;
+  if(change_inode(inode_num, &id, 0) == -1) return -ENOSPC;
 
   //flush_segment();
   return 0;
@@ -370,6 +349,11 @@ int fs_rmdir(const char *path)
 
   // remove dir entry from parent directory data
   if(remove_dir_entry(inode_num, parent_inode_num, &parent_id) == -1) return -ENOSPC;
+
+  for(int i = 0; i < id.block_count; i++){
+    int s = ((id.blocks[i]/SEGMENT_SIZE) - 1);
+    if(id.blocks[i] != 0) ss[s/SEG_SUM_IN_BLOCK].liveness[s%SEG_SUM_IN_BLOCK][(id.blocks[i]/BLOCK_SIZE)%DATA_BLOCKS_IN_SEGMENT] = 3;
+  }
 
   // update checkpoint
   cp.num_inodes--;
@@ -410,7 +394,7 @@ int fs_chmod(const char* path, mode_t mode)
         // write out changes
         i_table *block = (i_table *) malloc(BLOCK_SIZE);
         memcpy(block, &itable[i], BLOCK_SIZE);
-        cp.pointers[i] = add_to_segment(block, cp.pointers[i]);
+        cp.pointers[i] = add_to_segment(block, cp.pointers[i], -1);
         if(cp.pointers[i] == -1) return -ENOSPC;
         changed = 1;
       }
@@ -442,7 +426,7 @@ int fs_mknod(const char* path, mode_t mode, dev_t rdev)
 {
   inode id;
   inode parent_id;
-  int inode_number = 0;
+  int inode_num = 0;
   int parent_inode_num;
 
   // check if file exists
@@ -478,7 +462,7 @@ int fs_mknod(const char* path, mode_t mode, dev_t rdev)
   // see if there is a free inode number for this new directory
   for(int i = 0; i < MAX_INODES; i++){
     if(cp.inode_numbers[i] == 0){
-      inode_number = i;
+      inode_num = i;
       cp.inode_numbers[i] = 1;
       cp.num_inodes++;
       break;
@@ -497,12 +481,12 @@ int fs_mknod(const char* path, mode_t mode, dev_t rdev)
   id.block_count = 0;
 
   // add to parent directory data
-  call_rslt = add_dir_entry(file_name, inode_number, parent_inode_num, &parent_id);
+  call_rslt = add_dir_entry(file_name, inode_num, parent_inode_num, &parent_id);
   if(call_rslt == -1) return -ENOSPC;
   else if(call_rslt == -2) return -ENAMETOOLONG;
 
   // add inode and inode number pair to itable
-  if(change_inode(inode_number, &id, 0) == -1) return -ENOSPC;
+  if(change_inode(inode_num, &id, 0) == -1) return -ENOSPC;
 
   //flush_segment();
   return 0;
@@ -560,6 +544,9 @@ int fs_unlink(const char* path)
 
 int fs_truncate(const char* path, off_t size)
 {
+
+  garbage_collection();
+  
   inode id;
   // see if inode exists
   int inode_num = get_inode(path, &id);
@@ -588,7 +575,7 @@ int fs_truncate(const char* path, off_t size)
       char *block = (char *) malloc(BLOCK_SIZE);
       pread(fd_drive, block, BLOCK_SIZE, id.blocks[last_block-1]);
       memset((block + last_byte), 0, (BLOCK_SIZE - last_byte));
-      id.blocks[last_block-1] = add_to_segment(block, id.blocks[last_block-1]);
+      id.blocks[last_block-1] = add_to_segment(block, id.blocks[last_block-1], inode_num);
       if(id.blocks[last_block-1] == -1) return -ENOSPC;
     }
 
@@ -602,7 +589,7 @@ int fs_truncate(const char* path, off_t size)
 
       void *block = (void *) malloc(BLOCK_SIZE);
       memset(block, 0, BLOCK_SIZE);
-      id.blocks[i] = add_to_segment(block, id.blocks[i]); // id.blocks will be 0 anyways if its empty
+      id.blocks[i] = add_to_segment(block, id.blocks[i], inode_num); // id.blocks will be 0 anyways if its empty
       if(id.blocks[i] == -1) return -ENOSPC;
     }
 
@@ -726,7 +713,7 @@ int fs_write(const char* path, const char *buf, size_t size, off_t offset, struc
       else memcpy(temp_buf+first_byte, buf + (BLOCK_SIZE*i), BLOCK_SIZE-first_byte);
 
       // add to segment
-      id.blocks[i] = add_to_segment(temp_buf, id.blocks[i]);
+      id.blocks[i] = add_to_segment(temp_buf, id.blocks[i], inode_num);
       if(id.blocks[i] == -1) return -ENOSPC;
       first_byte = 0;
     }
@@ -746,7 +733,7 @@ int fs_write(const char* path, const char *buf, size_t size, off_t offset, struc
       else memcpy(temp_buf+first_byte, buf + (BLOCK_SIZE*i), BLOCK_SIZE-first_byte);
 
       // add to segment
-      id.blocks[i] = add_to_segment(temp_buf, id.blocks[i]);
+      id.blocks[i] = add_to_segment(temp_buf, id.blocks[i], inode_num);
       if(id.blocks[i] == -1) return -ENOSPC;
       first_byte = 0;
     }
@@ -764,9 +751,10 @@ int fs_write(const char* path, const char *buf, size_t size, off_t offset, struc
 
 
 
-/*
+
 int fs_statfs(const char* path, struct statvfs* stbuf)
 {
+
   stbuf->f_namemax = MAX_FILE_NAME;
   stbuf->f_frsize = BLOCK_SIZE;
   stbuf->f_bsize = BLOCK_SIZE;
@@ -775,16 +763,15 @@ int fs_statfs(const char* path, struct statvfs* stbuf)
   stbuf->f_ffree = MAX_INODES - cp.num_inodes;
   int freeblocks = 0;
   for(int i = 0; i < MAX_SEGMENTS; i++){
-    if(cp.segments_usage[i] == 0) freeblocks = freeblocks + DATA_BLOCKS_IN_SEGMENT;
-  }
-  for(int i = 0; i < DATA_BLOCKS_IN_SEGMENT; i++){
-    if(ss.liveness[i] == 0) freeblocks++;
+    for(int j = 0; j < DATA_BLOCKS_IN_SEGMENT; j++){
+      if(ss[i/SEG_SUM_BLOCKS].liveness[i%SEG_SUM_IN_BLOCK][j] == 0) freeblocks++;
+    }
   }
   stbuf->f_blocks = freeblocks;
   stbuf->f_bavail = freeblocks;
   stbuf->f_bfree = freeblocks;
   return 0;
-}*/
+}
 
 
 

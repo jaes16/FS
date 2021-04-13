@@ -55,6 +55,8 @@
 #define MAX_INODES 2496 // = MAX_BLOCKS (sort of overshooting)
 #define MAX_ITABLE_BLOCKS 64 // ITABLE_MAX_SIZE/BLOCK_SIZE rounded up
 #define ITABLE_ENT_IN_BLOCK 39 // BLOCK_SIZE/ITABLE_ENTRY_SIZE
+#define SEG_SUM_BLOCKS 2 // (MAX_BLOCKS * sizeof(short+char))/BLOCK_SIZE, rounded up
+#define SEG_SUM_IN_BLOCK 42 // (BLOCK_SIZE/(sizeof(short+char))) /DATA_BLOCKS_IN_SEGMENT rounded down
 
 #define DATA_START 131072 // = SEGMENT_SIZE
 #define SECOND_CR 10354688 // DRIVE_SIZE - SEGMENT_SIZE
@@ -110,10 +112,11 @@ typedef struct // size: BLOCK_SIZE
 
   int pointers[MAX_ITABLE_BLOCKS]; // 256 bytes, pointing to inode table blocks
 
-  int segsum_loc;
-  int segments_usage[MAX_SEGMENTS]; // a list of which segments are being used. could use only bits, but we have an abundance of space left. 312 bytes
+  int segsum_loc[SEG_SUM_BLOCKS];
+  // a list of which segments are being used. could use only bits, but we have an abundance of space left. 312 bytes
+  int segments_usage[MAX_SEGMENTS]; // 0 for unused segment, 1 for used segment, 2 for segments just written out by garbage collection
 
-  char pad[BLOCK_SIZE-3093];
+  char pad[BLOCK_SIZE-3097];
 } checkpoint;
 
 typedef struct // size: SEGMENT_SIZE
@@ -127,8 +130,9 @@ typedef struct // size: SEGMENT_SIZE
 
 typedef struct // size: BLOCK_SIZE
 {
-  char liveness[MAX_SEGMENTS][DATA_BLOCKS_IN_SEGMENT]; // 2418 bytes
-  char pad[BLOCK_SIZE - (MAX_SEGMENTS*DATA_BLOCKS_IN_SEGMENT)];
+  char liveness[SEG_SUM_IN_BLOCK][DATA_BLOCKS_IN_SEGMENT];
+  short inode_num[SEG_SUM_IN_BLOCK][DATA_BLOCKS_IN_SEGMENT];
+  char pad[BLOCK_SIZE - (3 * SEG_SUM_IN_BLOCK * DATA_BLOCKS_IN_SEGMENT)];
 } seg_summary;
 
 
@@ -142,7 +146,7 @@ typedef struct // size: 104 = ITABLE_ENTRY_SIZE
 
 
 
-typedef struct
+typedef struct // size: BLOCK_SIZE
 {
   itable_entry num_to_inodes[ITABLE_ENT_IN_BLOCK];
   char pad[BLOCK_SIZE-(ITABLE_ENTRY_SIZE * ITABLE_ENT_IN_BLOCK)];
@@ -164,7 +168,7 @@ typedef struct // size: 36 bytes = 32 char + 1 int.
 
 
 extern void *segment[DATA_BLOCKS_IN_SEGMENT]; // might not always be filled, depending on the size of the data the pointers point to
-extern seg_summary ss;
+extern seg_summary ss[SEG_SUM_BLOCKS];
 extern int which_seg;
 
 extern i_table *itable; // table of inodes. Can grow and shrink as needed, in sizes of blocks. Must malloc realloc and free
@@ -236,7 +240,7 @@ int fs_read(const char* path, char *buf, size_t size, off_t offset, struct fuse_
 int fs_write(const char* path, const char *buf, size_t size, off_t offset, struct fuse_file_info* fi);
 
 
-//int fs_statfs(const char* path, struct statvfs* stbuf);
+int fs_statfs(const char* path, struct statvfs* stbuf);
 
 
 static struct fuse_operations fs_filesystem_operations = {
@@ -255,7 +259,7 @@ static struct fuse_operations fs_filesystem_operations = {
     .open        = fs_open,
     .read        = fs_read,
     .write       = fs_write,
-    //.statfs      = fs_statfs,
+    .statfs      = fs_statfs,
 
     /*
     .readlink    = fs_readlink,
