@@ -18,8 +18,8 @@
 #include <fcntl.h>
 #include <fuse.h>
 #include <time.h>
-#include "fs.h"
-#include "fs_helper.h"
+#include "../include/fs.h"
+#include "../include/fs_helper.h"
 
 
 

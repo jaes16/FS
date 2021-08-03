@@ -22,8 +22,8 @@
 #include <fcntl.h>
 #include <fuse.h>
 #include <time.h>
-#include "fs.h"
-#include "fs_helper.h"
+#include "../include/fs.h"
+#include "../include/fs_helper.h"
 
 
 
@@ -546,7 +546,7 @@ int fs_truncate(const char* path, off_t size)
 {
 
   garbage_collection();
-  
+
   inode id;
   // see if inode exists
   int inode_num = get_inode(path, &id);

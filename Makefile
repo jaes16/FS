@@ -16,10 +16,10 @@ CFLAGS_OSXFUSE += -D_DARWIN_USE_64_BIT_INODE
 
 CFLAGS_EXTRA = -Wall -g $(CFLAGS)
 
-LIBS = -losxfuse
+LIBS = -lfuse
 
-fs: fs.c fs_helper.c
-	gcc $(CFLAGS_OSXFUSE) $(CFLAGS_EXTRA) fs.c fs_helper.c -o fs $(LIBS)
+build/fs: src/fs.c src/fs_helper.c
+	gcc $(CFLAGS_OSXFUSE) $(CFLAGS_EXTRA) src/fs.c src/fs_helper.c -o build/fs $(LIBS)
 
 #%.o: %.c
 #	$(CC) $(CFLAGS_OSXFUSE) $(CFLAGS_EXTRA) -o $@ -c $< $(LIBS)
