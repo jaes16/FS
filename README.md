@@ -9,7 +9,7 @@ A log-structure file system, built on top of FUSE. This project is mainly a hobb
 
 ## Running the FS:
 
-1. Call `make` to create the kernel. The makefile will need tweaking according to how FUSE was installed.
+1. Call `make`. The makefile will need tweaking according to how FUSE was installed.
 2. Create a new directory in the `build` directory (ex. `build/test`.)
 3. Run the file system on the new directory (ex. `build/fs build/test`)
 4. Now the new directory is mounted with the file system.
